@@ -19,8 +19,8 @@ FTNet/
 |-- FTNet.py
 |-- FTNet-T.py
 |-- config.yaml
-|-- run_4shot_2000.sh
-|-- run_4shot_2000_train.sh
+|-- run_4shot.sh
+|-- run_4shot_train.sh
 |-- networks/clip/
 `-- README.md
 ```
@@ -99,14 +99,12 @@ Run directly:
 CUDA_VISIBLE_DEVICES=0 python FTNet.py \
   --config config.yaml \
   --shots 4 \
-  --max-test-per-class 2000 \
   --init-beta 15
 ```
 
 Arguments:
 
 - `--shots`: number of cache images per class and dataset
-- `--max-test-per-class`: maximum test images sampled from each class of each dataset
 - `--seed`: random seed used for cache and test sampling
 - `--init-beta`: cache-affinity sharpness
 - `--config`: YAML configuration path
@@ -122,11 +120,10 @@ ftnet_<shots>shot_beta<beta>_results.json
 Update the Conda path, environment name, repository path and GPU selection in the script for your machine.
 
 ```bash
-bash run_4shot_2000.sh
-bash run_4shot_2000.sh 15
+bash run_4shot.sh
 ```
 
-The optional first argument overrides beta. The effective test limit is determined by `--max-test-per-class` inside the script, not by its filename. The current script uses `20000`.
+The optional first argument overrides beta.
 
 ## Trainable FTNet-T
 
@@ -136,17 +133,16 @@ The optional first argument overrides beta. The effective test limit is determin
 CUDA_VISIBLE_DEVICES=0 python FTNet-T.py \
   --config config.yaml \
   --shots 4 \
-  --max-test-per-class 2000 \
   --init-beta 4 \
   --epochs 20 \
   --learning-rate 0.002 \
   --batch-size 32
 ```
 
-Or use:
+Or use the training runner:
 
 ```bash
-bash run_4shot_2000_train.sh 4 20 0.002 32
+bash run_4shot_train.sh 4 20 0.002 32
 ```
 
 The positional arguments are:
@@ -163,12 +159,7 @@ FTNet reports per-dataset and mean Accuracy and ROC AUC. FTNet-T additionally re
 
 ## Reproducibility Notes
 
-The current `FTNet.py` uses one seeded random-number generator for both cache selection and test subsampling. Repeating exactly the same command with an unchanged dataset produces the same split. However, changing `--max-test-per-class` advances that generator differently and can change cache samples selected for subsequent classes and datasets.
-
-For fair comparisons across different test-set limits:
-
-1. keep and reuse a fixed cache image list; or
-2. use independent random-number generators for cache and test selection.
+Repeating the same command with an unchanged dataset and the same seed produces the same sampling split.
 
 Few-shot performance can vary substantially across seeds because only a small number of cache images represent each class. Formal experiments should report the mean and standard deviation over multiple seeds.
 
@@ -179,9 +170,8 @@ Keep these settings fixed when comparing runs:
 - cache shots
 - CLIP checkpoint and feature layer
 - beta
-- test-set size
 
-Result filenames do not contain the seed or test-set limit. Rename results or set `evaluation.results_file` to avoid overwriting runs.
+Result filenames do not contain the seed. Rename results or set `evaluation.results_file` to avoid overwriting runs.
 
 ## Configuration
 
