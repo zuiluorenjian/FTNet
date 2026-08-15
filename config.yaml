@@ -1,7 +1,7 @@
 
 data:
-  test_data_root: 
- 
+  test_data_root: /opt/data/private/ysb/NPR-DeepfakeDetection/dataset/GenImage
+
   train_data_root:   # 训练数据路径
   datasets: ['ADM','BigGAN','glide','Midjourney','SD','VQDM']
   multiclass: [0, 0, 0, 0, 0, 0]
@@ -9,30 +9,27 @@ data:
  #['DALLE','ddpm','guided-diffusion','improved-diffusion','midjourney']
 # 模型配置
 model:
-  backbone: 'ViT-L/14'  # CLIP模型架构
+  backbone: '/opt/data/private/ysb/weights/ViT-L-14.pt'  # CLIP模型架构
   device: 'cuda'        # 设备
   download_root:   # 模型下载路径
 
 # CLIP特征提取配置
-clip_layer: 12                  
+clip_layer: 12
 
 
 # Cache配置
 cache:
   cache_dir: './cache_deepfake'
-  shots_per_class: 2    
-  augment_epochs: 3    
+  shots_per_class: 4
+  augment_epochs: 3
   load_cache: False     # 是否从文件加载cache
-  
+
 patch_matching:
   patch_size: 56  # 每个 patch 的像素大小（例如，224x224 图像分割为 4x4 网格）
   num_patches: 16  # patch 总数（自动计算为 (224 / patch_size)^2）
-# TIP-Adapter超参数
 hyperparams:
-  init_beta: 1.0        
-  init_alpha: 1.0       
-  search_hp: False         
-  search_steps: 5       # 每个参数的搜索步数（从30降到5以加速）
+  init_beta: 1.0
+  init_alpha: 1.0
 training:
   epochs: 20            # 训练轮数
   learning_rate: 0.001  # 学习率
@@ -43,7 +40,7 @@ training:
 
 # 评估配置
 evaluation:
-  batch_size: 64      
+  batch_size: 64
   save_results: true
   results_file: ''
 
@@ -54,7 +51,7 @@ logging:
 
 
 # knn:
-#   shots_per_class: 2     
+#   shots_per_class: 2
 #   k: 1                    # KNN的K值
 #   distance_metric: cosine # 距离度量: cosine/euclidean
 #   voting_method: distance_weighted # 投票方法

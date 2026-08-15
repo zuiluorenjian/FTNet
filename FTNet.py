@@ -6,6 +6,8 @@ import random
 import argparse
 import numpy as np
 from tqdm import tqdm
+from pathlib import Path
+from PIL import Image
 
 import torch
 import torch.nn as nn
@@ -48,7 +50,8 @@ class CacheDataset(Dataset):
         return len(self.image_paths)
 
     def __getitem__(self, idx):
-        image = self.preprocess(self.image_paths[idx])
+        image = Image.open(self.image_paths[idx]).convert("RGB")
+        image = self.preprocess(image)
         label = self.labels[idx]
         return image, label
 
@@ -63,9 +66,12 @@ class FTNet:
         self.config = config
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
 
+        model_cfg = self.config["model"]
+        requested_device = model_cfg.get("device", "cuda")
+        self.device = requested_device if requested_device != "cuda" or torch.cuda.is_available() else "cpu"
         self.clip_model, self.preprocess = clip_load(
-            self.config["clip_model"],
-            device=self.device
+            model_cfg["backbone"], device=self.device,
+            download_root=model_cfg.get("download_root")
         )
         self.clip_model.eval()
 
@@ -141,6 +147,7 @@ class FTNet:
         else:
             features = self.clip_model.encode_image(images)
 
+        features = features.float()
         features = F.normalize(features, dim=-1)
 
         return features
@@ -158,7 +165,7 @@ class FTNet:
 
         loader = DataLoader(
             dataset,
-            batch_size=self.config["batch_size"],
+            batch_size=self.config["training"]["batch_size"],
             shuffle=False,
             collate_fn=collate_fn
         )
@@ -184,7 +191,7 @@ class FTNet:
 
         self.cache_values = F.one_hot(
             labels,
-            num_classes=self.config["num_classes"]
+            num_classes=2
         ).float().to(self.device)
 
     # --------------------------------------
@@ -196,7 +203,8 @@ class FTNet:
         features = self._extract_image_features(images)
 
         affinity = features @ self.cache_keys
-        logits = torch.exp(self.config["beta"] * affinity) @ self.cache_values
+        beta = self.config["hyperparams"]["init_beta"]
+        logits = torch.exp(-beta + beta * affinity) @ self.cache_values
 
         return logits
 
@@ -220,7 +228,7 @@ class FTNet:
 
             loader = DataLoader(
                 dataset,
-                batch_size=self.config["batch_size"],
+                batch_size=self.config["evaluation"]["batch_size"],
                 shuffle=False,
                 collate_fn=collate_fn
             )
@@ -251,10 +259,72 @@ class FTNet:
 
         print("\nFTNet evaluation completed.")
 
+        mean_accuracy = float(np.mean([item["accuracy"] for item in results.values()]))
+        mean_auc = float(np.mean([item["auc"] for item in results.values()]))
+        print(f"Mean accuracy: {mean_accuracy:.4f}, mean AUC: {mean_auc:.4f}")
+
         return {
             "method": "FTNet",
+            "summary": {
+                "mean_accuracy": mean_accuracy,
+                "mean_auc": mean_auc
+            },
             "results": results
         }
+
+
+IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
+
+
+def _class_images(dataset_dirs, class_name):
+    paths = []
+    for dataset_dir in dataset_dirs:
+        class_dir = Path(dataset_dir) / class_name
+        if class_dir.is_dir():
+            paths.extend(
+                str(path) for path in class_dir.rglob("*")
+                if path.is_file() and path.suffix.lower() in IMAGE_EXTENSIONS
+            )
+    return sorted(paths)
+
+
+def prepare_few_shot_config(config, shots, seed, max_test_per_class=None):
+    """Discover GenImage folders and make a leakage-free per-dataset split."""
+    root = Path(config["data"]["test_data_root"] or "")
+    if not root.is_dir():
+        raise ValueError(f"Invalid data.test_data_root: {root}")
+
+    rng = random.Random(seed)
+    cache_images, cache_labels = [], []
+    test_datasets = {}
+    sd_parts = ["stable_diffusion_v_1_4", "stable_diffusion_v_1_5", "wukong"]
+
+    for name in config["data"]["datasets"]:
+        parts = sd_parts if name.lower() == "sd" else [name]
+        dirs = [root / part for part in parts]
+        # dirs = [root / name]
+        images, labels = [], []
+        for label, class_name in enumerate(("0_real", "1_fake")):
+            candidates = _class_images(dirs, class_name)
+            if len(candidates) <= shots:
+                raise ValueError(
+                    f"{name}/{class_name} has {len(candidates)} images; need more than {shots}"
+                )
+            selected = set(rng.sample(candidates, shots))
+            cache_images.extend(sorted(selected))
+            cache_labels.extend([label] * shots)
+            remaining = [path for path in candidates if path not in selected]
+            if max_test_per_class and len(remaining) > max_test_per_class:
+                remaining = rng.sample(remaining, max_test_per_class)
+            images.extend(remaining)
+            labels.extend([label] * len(remaining))
+        test_datasets[name] = {"images": images, "labels": labels}
+        print(f"{name}: cache={2 * shots}, test={len(images)}")
+
+    config["cache_images"] = cache_images
+    config["cache_labels"] = cache_labels
+    config["test_datasets"] = test_datasets
+    return config
 
 
 # ==========================================
@@ -268,6 +338,11 @@ def main():
     )
     parser.add_argument('--config', type=str, default='config.yaml')
     parser.add_argument('--seed', type=int, default=42)
+    parser.add_argument('--init-beta', type=float, default=None)
+    parser.add_argument('--shots', type=int, default=None,
+                        help='Cache examples per class and dataset')
+    parser.add_argument('--max-test-per-class', type=int, default=1000,
+                        help='Optional evaluation cap per class for a smoke test')
 
     args = parser.parse_args()
 
@@ -275,6 +350,11 @@ def main():
 
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
+    if args.init_beta is not None:
+        config["hyperparams"]["init_beta"] = args.init_beta
+
+    shots = args.shots or config["cache"]["shots_per_class"]
+    config = prepare_few_shot_config(config, shots, args.seed, args.max_test_per_class)
 
     model = FTNet(config)
 
@@ -284,8 +364,11 @@ def main():
 
     results = model.run_evaluation()
 
-    with open("ftnet_results.json", "w") as f:
+    beta = float(config["hyperparams"]["init_beta"])
+    results_file = config["evaluation"].get("results_file") or f"ftnet_{shots}shot_beta{beta:g}_results.json"
+    with open(results_file, "w") as f:
         json.dump(results, f, indent=4)
+    print(f"Results saved to {results_file}")
 
 
 if __name__ == "__main__":
