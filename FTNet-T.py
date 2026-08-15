@@ -1,236 +1,161 @@
 #!/usr/bin/env python3
-
-#!/usr/bin/env python3
-
-import os
-import sys
 import argparse
-import yaml
 import json
-import time
+import os
+import random
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-import numpy as np
-import random
-import glob
-from PIL import Image
-import torchvision.transforms as transforms
-from torch.utils.data import Dataset, DataLoader
+import yaml
+from sklearn.metrics import accuracy_score, average_precision_score, f1_score, roc_auc_score
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from sklearn.metrics import average_precision_score, roc_auc_score, f1_score
-
 from networks.clip.clip import load as clip_load
-from networks.clip.clip import tokenize as clip_tokenize
+from FTNet import CacheDataset, collate_fn, prepare_few_shot_config
 
 
-def set_random_seed(seed=42):
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+def set_random_seed(seed):
+    random.seed(seed); np.random.seed(seed); torch.manual_seed(seed); torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
 
 
-def collate_fn(batch):
-    batch = list(filter(lambda x: x[0] is not None, batch))
-    if not batch:
-        return torch.empty(0), torch.empty(0)
-    images, labels = zip(*batch)
-    images = torch.stack(images, dim=0)
-    labels = torch.tensor(labels)
-    return images, labels
-
-
-class CacheDataset(Dataset):
-    def __init__(self, image_paths, labels, preprocess):
-        self.image_paths = image_paths
-        self.labels = labels
-        self.preprocess = preprocess
-
-    def __len__(self):
-        return len(self.image_paths)
-
-    def __getitem__(self, idx):
-        img_path = self.image_paths[idx]
-        label = self.labels[idx]
-        try:
-            image = Image.open(img_path).convert('RGB')
-            image_tensor = self.preprocess(image)
-            return image_tensor, label
-        except Exception:
-            return None, -1
-
-
-class FTNet_T:
-
-    def __init__(self, config):
+class FTNetT:
+    def __init__(self, config, seed=42):
         self.config = config
-        self.device = config['model']['device']
-        self.backbone = config['model']['backbone']
-        self.download_root = config['model'].get('download_root', None)
+        requested = config["model"].get("device", "cuda")
+        self.device = requested if requested != "cuda" or torch.cuda.is_available() else "cpu"
+        self.beta = float(config["hyperparams"]["init_beta"])
+        set_random_seed(seed)
+        self.clip_model, self.preprocess = clip_load(
+            config["model"]["backbone"], device=self.device,
+            download_root=config["model"].get("download_root"))
+        self.clip_model.eval().requires_grad_(False)
+        self.cache_keys = self.cache_values = self.adapter = None
 
-        set_random_seed(40)
-
-        self._load_clip_model()
-
-        self.test_datasets = config['data']['datasets']
-
-        self.cache_keys = None
-        self.cache_values = None
-
-        self.beta = config['hyperparams']['init_beta']
-        self.alpha = config['hyperparams']['init_alpha']
-
-        os.makedirs(config['cache']['cache_dir'], exist_ok=True)
-
-    def _load_clip_model(self):
-        if self.download_root:
-            self.clip_model, self.preprocess = clip_load(
-                self.backbone, device=self.device, download_root=self.download_root
-            )
-        else:
-            self.clip_model, self.preprocess = clip_load(
-                self.backbone, device=self.device
-            )
-
-        self.clip_model.eval()
-
-        # ===== DO NOT MODIFY THIS BLOCK =====
-        extract_layer = self.config.get('clip_layer', None)
-        with torch.no_grad():
-            dummy_image = torch.randn(1, 3, 224, 224).to(self.device)
-
-            if extract_layer is not None:
-                try:
-                    if hasattr(self.clip_model, 'extract_features'):
-                        layer_features = self.clip_model.extract_features(
-                            dummy_image, extract=[extract_layer]
-                        )
-                        layer_key = f'layer_{extract_layer}_cls'
-                        if layer_key in layer_features:
-                            sample_features = layer_features[layer_key]
-                        else:
-                            available_keys = list(layer_features.keys())
-                            if available_keys:
-                                sample_features = layer_features[available_keys[0]]
-                                print(
-                                    f"Warning: {layer_key} not found, using {available_keys[0]}"
-                                )
-                            else:
-                                sample_features = self.clip_model.encode_image(
-                                    dummy_image
-                                )
-                    else:
-                        sample_features = self.clip_model.encode_image(dummy_image)
-                except Exception as e:
-                    print(
-                        f"Warning: failed to get features from layer {extract_layer}: {e}, using default encoding"
-                    )
-                    sample_features = self.clip_model.encode_image(dummy_image)
-            else:
-                sample_features = self.clip_model.encode_image(dummy_image)
-
-            self.feature_dim = sample_features.shape[-1]
-            self.feature_dtype = sample_features.dtype
-
-        print(
-            f"CLIP feature dimension: {self.feature_dim}, data type: {self.feature_dtype}"
-        )
-        # ====================================
-
-    def _extract_image_features(self, images):
-        extract_layer = self.config.get('clip_layer', None)
-
-        if extract_layer is not None and hasattr(self.clip_model, 'extract_features'):
-            try:
-                layer_features = self.clip_model.extract_features(
-                    images, extract=[extract_layer]
-                )
-                layer_key = f'layer_{extract_layer}_cls'
-                if layer_key in layer_features:
-                    features = layer_features[layer_key]
-                else:
-                    available_keys = list(layer_features.keys())
-                    features = layer_features[available_keys[0]]
-            except Exception:
-                features = self.clip_model.encode_image(images)
+    @torch.no_grad()
+    def extract_features(self, images):
+        layer = self.config.get("clip_layer")
+        if layer is not None and hasattr(self.clip_model, "extract_features"):
+            extracted = self.clip_model.extract_features(images, extract=[layer])
+            key = f"layer_{layer}_cls"
+            if key not in extracted:
+                raise KeyError(f"Missing {key}; available keys: {list(extracted)}")
+            features = extracted[key]
         else:
             features = self.clip_model.encode_image(images)
+        return F.normalize(features.float(), dim=-1)
 
-        features = features.float()
-        features = features / features.norm(dim=-1, keepdim=True)
-        return features
+    def build_cache(self):
+        dataset = CacheDataset(self.config["cache_images"], self.config["cache_labels"], self.preprocess)
+        loader = DataLoader(dataset, batch_size=self.config["training"]["batch_size"],
+                            shuffle=False, collate_fn=collate_fn)
+        features, labels = [], []
+        for images, batch_labels in tqdm(loader, desc="Building trainable cache"):
+            features.append(self.extract_features(images.to(self.device)))
+            labels.append(batch_labels)
+        cache_features = torch.cat(features)
+        cache_labels = torch.cat(labels).to(self.device)
+        self.cache_keys = cache_features.t().contiguous()
+        self.cache_values = F.one_hot(cache_labels, num_classes=2).float()
+        self.adapter = nn.Linear(cache_features.shape[1], cache_features.shape[0], bias=False)
+        self.adapter = self.adapter.to(self.device, dtype=torch.float32)
+        self.adapter.weight = nn.Parameter(cache_features.clone())
+        print(f"Cache: {cache_features.shape[0]} samples, feature dim: {cache_features.shape[1]}, dtype: {cache_features.dtype}")
 
-    def build_cache_model(self, cache_images, cache_labels):
-        all_features = []
+    def cache_logits(self, features):
+        affinity = self.adapter(features)
+        return torch.exp(-self.beta + self.beta * affinity) @ self.cache_values
 
-        with torch.no_grad():
-            for img_path in tqdm(cache_images, desc="Extracting CLIP features"):
-                try:
-                    image = Image.open(img_path).convert('RGB')
-                    input_tensor = self.preprocess(image).unsqueeze(0).to(self.device)
-                    features = self._extract_image_features(input_tensor)
-                    all_features.append(features)
-                except Exception:
-                    continue
+    def train_adapter(self):
+        dataset = CacheDataset(self.config["cache_images"], self.config["cache_labels"], self.preprocess)
+        loader = DataLoader(dataset, batch_size=self.config["training"]["batch_size"],
+                            shuffle=True, collate_fn=collate_fn)
+        epochs = int(self.config["training"]["epochs"])
+        optimizer = torch.optim.AdamW(
+            self.adapter.parameters(), lr=float(self.config["training"]["learning_rate"]),
+            weight_decay=float(self.config["training"]["weight_decay"]))
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        self.adapter.train()
+        for epoch in range(epochs):
+            total_loss = correct = total = 0
+            for images, labels in loader:
+                labels = labels.to(self.device)
+                features = self.extract_features(images.to(self.device))
+                logits = self.cache_logits(features)
+                loss = F.cross_entropy(logits, labels)
+                optimizer.zero_grad(); loss.backward(); optimizer.step()
+                total_loss += loss.item() * labels.numel()
+                correct += (logits.argmax(1) == labels).sum().item(); total += labels.numel()
+            scheduler.step()
+            print(f"Epoch {epoch + 1:02d}/{epochs}: loss={total_loss / total:.4f}, cache_acc={correct / total:.4f}, lr={scheduler.get_last_lr()[0]:.6g}")
+        self.adapter.eval()
 
-        if not all_features:
-            raise ValueError("No valid features extracted for cache model.")
+    @torch.no_grad()
+    def evaluate(self):
+        results = {}
+        for name, dataset_config in self.config["test_datasets"].items():
+            dataset = CacheDataset(dataset_config["images"], dataset_config["labels"], self.preprocess)
+            loader = DataLoader(dataset, batch_size=self.config["evaluation"]["batch_size"],
+                                shuffle=False, collate_fn=collate_fn)
+            predictions, probabilities, labels = [], [], []
+            for images, batch_labels in tqdm(loader, desc=f"Evaluating {name}"):
+                logits = self.cache_logits(self.extract_features(images.to(self.device)))
+                probs = F.softmax(logits, dim=1)
+                predictions.extend(logits.argmax(1).cpu().tolist())
+                probabilities.extend(probs[:, 1].cpu().tolist())
+                labels.extend(batch_labels.tolist())
+            results[name] = {
+                "accuracy": float(accuracy_score(labels, predictions)),
+                "ap": float(average_precision_score(labels, probabilities)),
+                "auc": float(roc_auc_score(labels, probabilities)),
+                "f1": float(f1_score(labels, predictions)),
+            }
+            print(f"{name}: {results[name]}")
+        summary = {key: float(np.mean([metrics[key] for metrics in results.values()]))
+                   for key in ("accuracy", "ap", "auc", "f1")}
+        print(f"Mean: {summary}")
+        return {"method": "FTNet-T", "summary": summary, "results": results}
 
-        self.cache_keys = torch.cat(all_features, dim=0).t()
-        self.cache_values = F.one_hot(
-            torch.tensor(cache_labels), num_classes=2
-        ).float().to(self.device)
-
-    def create_adapter(self):
-        adapter = nn.Linear(
-            self.cache_keys.shape[0],
-            self.cache_keys.shape[1],
-            bias=False,
-        ).to(self.device)
-
-        adapter.weight = nn.Parameter(self.cache_keys.t())
-        return adapter
-
-    def run(self):
-        print("FTNet-T initialized successfully.")
+    def run(self, shots):
+        self.build_cache(); self.train_adapter(); results = self.evaluate()
+        cache_dir = self.config["cache"]["cache_dir"]
+        os.makedirs(cache_dir, exist_ok=True)
+        train_cfg = self.config["training"]
+        run_name = (f"{shots}shot_beta{self.beta:g}_ep{int(train_cfg['epochs'])}"
+                    f"_lr{float(train_cfg['learning_rate']):g}_bs{int(train_cfg['batch_size'])}")
+        model_path = os.path.join(cache_dir, f"ftnet_t_adapter_{run_name}.pt")
+        torch.save(self.adapter.state_dict(), model_path)
+        results_path = self.config["evaluation"].get("results_file") or f"ftnet_t_{run_name}_results.json"
+        with open(results_path, "w", encoding="utf-8") as file:
+            json.dump(results, file, indent=4)
+        print(f"Adapter saved to {model_path}"); print(f"Results saved to {results_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(
-        description="FTNet-T for Deepfake Detection"
-    )
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='tip_adapter_config.yaml',
-        help='Path to the config file',
-    )
-    parser.add_argument(
-        '--clip_layer',
-        type=int,
-        default=None,
-        help='CLIP feature extraction layer (e.g., 12)',
-    )
+    parser = argparse.ArgumentParser(description="Trainable FTNet cache adapter")
+    parser.add_argument("--config", default="config.yaml")
+    parser.add_argument("--clip_layer", type=int, default=None)
+    parser.add_argument("--shots", type=int, default=None)
+    parser.add_argument("--max-test-per-class", type=int, default=1000)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--init-beta", type=float, default=None)
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--learning-rate", type=float, default=None)
+    parser.add_argument("--batch-size", type=int, default=None)
     args = parser.parse_args()
-
-    if not os.path.exists(args.config):
-        print(f"Config file not found: {args.config}", file=sys.stderr)
-        return
-
-    with open(args.config, 'r', encoding='utf-8') as f:
-        config = yaml.load(f, Loader=yaml.FullLoader)
-
-    if args.clip_layer is not None:
-        config['clip_layer'] = args.clip_layer
-
-    model = FTNet_T(config)
-    model.run()
+    with open(args.config, encoding="utf-8") as file:
+        config = yaml.safe_load(file)
+    if args.clip_layer is not None: config["clip_layer"] = args.clip_layer
+    if args.init_beta is not None: config["hyperparams"]["init_beta"] = args.init_beta
+    if args.epochs is not None: config["training"]["epochs"] = args.epochs
+    if args.learning_rate is not None: config["training"]["learning_rate"] = args.learning_rate
+    if args.batch_size is not None: config["training"]["batch_size"] = args.batch_size
+    shots = args.shots or config["cache"]["shots_per_class"]
+    config = prepare_few_shot_config(config, shots, args.seed, args.max_test_per_class)
+    FTNetT(config, args.seed).run(shots)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
