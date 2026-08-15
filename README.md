@@ -31,6 +31,10 @@ FTNet/
 pip install torch torchvision numpy pillow pyyaml tqdm scikit-learn
 ```
 
+### Environment and Weights
+
+The packaged Conda environment and pretrained weights are available on [Google Drive](https://drive.google.com/file/d/1UhJQUVoUfACznYRy38TV43NMoBtyRwBy/view?usp=sharing).
+
 The code uses the local CLIP implementation under `networks/clip`. Set the pretrained checkpoint in `config.yaml`:
 
 ```yaml
